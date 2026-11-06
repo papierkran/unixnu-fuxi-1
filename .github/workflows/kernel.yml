@@ -1,0 +1,69 @@
+name: Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UNIXNU_REPO: UniXNU/UniXNU
+  UNIXNU_REF: main
+
+jobs:
+  kernel:
+    name: fuxi kernel (UFS, display, GPU archives)
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fuxi
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UNIXNU_REPO }}
+          ref: ${{ env.UNIXNU_REF }}
+          path: unixnu
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Select Xcode
+        run: |
+          dir=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)
+          [ -n "$dir" ] || { echo "::error::no Xcode 26"; exit 1; }
+          echo "DEVELOPER_DIR=$dir/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$dir/Contents/Developer" xcodebuild -version
+      - name: Install host tools
+        run: brew install llvm lld mtools dtc openssl@3 || true
+      - name: Select the device
+        working-directory: unixnu
+        run: ./unixnu defconfig fuxi_full_defconfig --device "$GITHUB_WORKSPACE/fuxi"
+      - name: Build kernel
+        working-directory: unixnu
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./unixnu build kernel --device "$GITHUB_WORKSPACE/fuxi"
+      - name: Report
+        if: always()
+        run: |
+          ls -l unixnu/out/*/*/*/kernel 2>/dev/null || true
+          find unixnu/out -name '*.log' -size -20M | head -40
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-logs
+          path: |
+            unixnu/out/*/*/*/logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
