@@ -1,0 +1,97 @@
+name: Image
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UNIXNU_REPO: UniXNU/UniXNU
+  UNIXNU_REF: main
+  UEFI_REPO: yigezhong011-ops/hakios-uefi-fuxi
+  UEFI_REF: main
+  SEED: "0xce854c9ae043320b"
+
+jobs:
+  image:
+    name: fuxi boot image (kernel, payload, UEFI volume)
+    runs-on: macos-26
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fuxi
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UNIXNU_REPO }}
+          ref: ${{ env.UNIXNU_REF }}
+          path: unixnu
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UEFI_REPO }}
+          ref: ${{ env.UEFI_REF }}
+          path: uefi-fuxi
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Select Xcode
+        run: |
+          dir=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)
+          [ -n "$dir" ] || { echo "::error::no Xcode 26"; exit 1; }
+          echo "DEVELOPER_DIR=$dir/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$dir/Contents/Developer" xcodebuild -version
+      - name: Install host tools
+        run: brew install llvm lld mtools dtc lzfse openssl@3 unifdef || true
+      - name: Select the device
+        working-directory: unixnu
+        run: ./unixnu defconfig fuxi_full_defconfig --device "$GITHUB_WORKSPACE/fuxi"
+      - name: Build kernel
+        working-directory: unixnu
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./unixnu build kernel --device "$GITHUB_WORKSPACE/fuxi"
+      - name: Build the userdata image (mounts the OS, provides the Data fixture source)
+        working-directory: unixnu
+        run: ./unixnu build userdata --device "$GITHUB_WORKSPACE/fuxi"
+      - name: Data seed
+        working-directory: unixnu
+        run: |
+          python3 scripts/prepare-owner-data-fixture.py || true
+          ls -l build/owner-data-fixture 2>/dev/null || true
+      - name: Build payload
+        working-directory: unixnu
+        run: |
+          seed=build/owner-data-fixture/owner-data-32.cdr
+          [ -f "$seed" ] || seed=$(ls build/owner-data-fixture/*.cdr 2>/dev/null | head -n 1)
+          args=(--device "$GITHUB_WORKSPACE/fuxi" --uefi "$GITHUB_WORKSPACE/uefi-fuxi"
+                --unique-chip-id "$SEED")
+          [ -n "$seed" ] && args+=(--data-ramdisk "$seed")
+          ./unixnu build payload "${args[@]}"
+      - name: Pack the boot image
+        run: |
+          payload=$(find unixnu/out -name payload.img | head -n 1)
+          [ -n "$payload" ] || { echo "::error::payload.img not found"; exit 1; }
+          python3 uefi-fuxi/scripts/bootimage.py --ramdisk "$payload" -o "$RUNNER_TEMP/boot.img"
+          cat unixnu/out/fuxi/payload/payload.json || true
+          ls -l "$RUNNER_TEMP/boot.img"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuxi-boot
+          path: |
+            ${{ runner.temp }}/boot.img
+            unixnu/out/fuxi/payload/payload.json
+          retention-days: 7
+      - name: Logs
+        if: always()
+        run: find unixnu/out -name '*.log' -size -20M | head -40
